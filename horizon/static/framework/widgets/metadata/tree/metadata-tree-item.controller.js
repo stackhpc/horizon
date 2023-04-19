@@ -40,16 +40,18 @@
       ctrl.item.leaf.required = false;
     }
 
-    if ('item' in ctrl && 'leaf' in ctrl.item && ctrl.item.leaf.type === 'array') {
-      ctrl.values = ctrl.item.leaf.items.enum.filter(filter).sort();
+    this.$onInit = function init() {
+      if ('item' in ctrl && 'leaf' in ctrl.item && ctrl.item.leaf.type === 'array') {
+        ctrl.values = ctrl.item.leaf.items.enum.filter(filter).sort();
 
-      if (!ctrl.item.leaf.readonly) {
-        ctrl.addValue = addValue;
-        ctrl.removeValue = removeValue;
-        ctrl.switchOpened = switchOpened;
-        ctrl.opened = ctrl.item.leaf.value.length === 0;
+        if (!ctrl.item.leaf.readonly) {
+          ctrl.addValue = addValue;
+          ctrl.removeValue = removeValue;
+          ctrl.switchOpened = switchOpened;
+          ctrl.opened = ctrl.item.leaf.value.length === 0;
+        }
       }
-    }
+    };
 
     function formatErrorMessage(item, error) {
       if (error.min) {
