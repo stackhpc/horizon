@@ -231,6 +231,22 @@ class SelectFormFieldRegion(BaseFormFieldRegion):
         self.driver.execute_script(js_cmd)
 
 
+class ButtonGroupFormFieldRegion(BaseFormFieldRegion):
+    """Select button group."""
+
+    _element_locator_str_suffix = 'div.btn-group'
+    _button_label_locator = (by.By.CSS_SELECTOR, 'label.btn')
+
+    @property
+    def options(self):
+        options = self._get_elements(*self._button_label_locator)
+        results = {opt.text: opt for opt in options}
+        return results
+
+    def pick(self, option):
+        return self.options[option].click()
+
+
 class ThemableSelectFormFieldRegion(BaseFormFieldRegion):
     """Select box field."""
 
@@ -298,8 +314,7 @@ class ThemableSelectFormFieldRegion(BaseFormFieldRegion):
 class BaseFormRegion(baseregion.BaseRegion):
     """Base class for forms."""
 
-    _submit_locator = (by.By.CSS_SELECTOR, '*.btn.btn-primary')
-    _submit_danger_locator = (by.By.CSS_SELECTOR, '*.btn.btn-danger')
+    _submit_locator = (by.By.CSS_SELECTOR, '*.btn.btn-primary,*.btn.btn-danger')
     _cancel_locator = (by.By.CSS_SELECTOR, '*.btn.cancel')
     _default_form_locator = (by.By.CSS_SELECTOR, 'div.modal-dialog')
 
@@ -315,10 +330,7 @@ class BaseFormRegion(baseregion.BaseRegion):
 
     @property
     def _submit_element(self):
-        try:
-            submit_element = self._get_element(*self._submit_locator)
-        except exceptions.NoSuchElementException:
-            submit_element = self._get_element(*self._submit_danger_locator)
+        submit_element = self._get_element(*self._submit_locator)
         return submit_element
 
     def submit(self):
@@ -424,6 +436,13 @@ class FormRegion(BaseFormRegion):
     def fields(self):
         """List of all fields that form contains."""
         return self._get_form_fields()
+
+
+class FormRegionNG(FormRegion):
+    """Angular-based form."""
+
+    _fields_locator = (by.By.CSS_SELECTOR, 'div.content')
+    _submit_locator = (by.By.CSS_SELECTOR, '*.btn.btn-primary.finish')
 
 
 class TabbedFormRegion(FormRegion):
