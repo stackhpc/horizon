@@ -37,11 +37,7 @@ class AdminIndexView(tabs.TabbedTableView):
         except Exception:
             exceptions.handle(self.request,
                               _('Unable to retrieve hypervisor statistics.'))
-        try:
-            context["providers"] = api.placement.get_providers(self.request)
-        except Exception:
-            exceptions.handle(self.request,
-                              _('Unable to retrieve providers statistics.'))
+
         return context
 
 

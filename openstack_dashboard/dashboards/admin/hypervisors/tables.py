@@ -22,24 +22,36 @@ class AdminHypervisorsTable(tables.DataTable):
     hostname = tables.WrappingColumn("hypervisor_hostname",
                                      link="horizon:admin:hypervisors:detail",
                                      verbose_name=_("Hostname"))
+
     hypervisor_type = tables.Column("hypervisor_type",
                                     verbose_name=_("Type"))
+
+    vcpus_used = tables.Column("vcpus_used",
+                               verbose_name=_("VCPUs (used)"))
+
+    vcpus = tables.Column("vcpus",
+                          verbose_name=_("VCPUs (total)"))
+
     memory_used = tables.Column('memory_mb_used',
                                 verbose_name=_("RAM (used)"),
                                 attrs={'data-type': 'size'},
                                 filters=(sizeformat.mb_float_format,))
+
     memory = tables.Column('memory_mb',
                            verbose_name=_("RAM (total)"),
                            attrs={'data-type': 'size'},
                            filters=(sizeformat.mb_float_format,))
+
     local_used = tables.Column('local_gb_used',
                                verbose_name=_("Local Storage (used)"),
                                attrs={'data-type': 'size'},
                                filters=(sizeformat.diskgbformat,))
+
     local = tables.Column('local_gb',
                           verbose_name=_("Local Storage (total)"),
                           attrs={'data-type': 'size'},
                           filters=(sizeformat.diskgbformat,))
+
     running_vms = tables.Column("running_vms",
                                 verbose_name=_("Instances"))
 
@@ -66,59 +78,3 @@ class AdminHypervisorInstancesTable(tables.DataTable):
     class Meta(object):
         name = "hypervisor_instances"
         verbose_name = _("Hypervisor Instances")
-
-
-class AdminProvidersTable(tables.DataTable):
-    name = tables.WrappingColumn("name",
-                                 verbose_name=_("Resource Provider Name"))
-    vcpus_used = tables.Column("vcpus_used",
-                               verbose_name=_("VCPUs used"))
-    vcpus_reserved = tables.Column("vcpus_reserved",
-                                   verbose_name=_("VCPUs reserved"))
-    vcpus = tables.Column("vcpus",
-                          verbose_name=_("VCPUs total"))
-    vcpus_ar = tables.Column("vcpus_ar",
-                             verbose_name=_("VCPUs allocation ratio"))
-    pcpus_used = tables.Column("pcpus_used",
-                               verbose_name=_("PCPUs used"))
-    pcpus_reserved = tables.Column("pcpus_reserved",
-                                   verbose_name=_("PCPUs reserved"))
-    pcpus = tables.Column("pcpus",
-                          verbose_name=_("PCPUs total"))
-    pcpus_ar = tables.Column("pcpus_ar",
-                             verbose_name=_("PCPUs allocation ratio"))
-    memory_used = tables.Column("memory_mb_used",
-                                verbose_name=_("RAM used"),
-                                attrs={'data-type': 'size'},
-                                filters=(sizeformat.mb_float_format,))
-    memory_reserved = tables.Column("memory_mb_reserved",
-                                    verbose_name=_("RAM reserved"),
-                                    attrs={'data-type': 'size'},
-                                    filters=(sizeformat.mb_float_format,))
-    memory = tables.Column("memory_mb",
-                           verbose_name=_("RAM total"),
-                           attrs={'data-type': 'size'},
-                           filters=(sizeformat.mb_float_format,))
-    memory_ar = tables.Column("memory_mb_ar",
-                              verbose_name=_("RAM allocation ratio"))
-    disk_used = tables.Column("disk_gb_used",
-                              verbose_name=_("Storage used"),
-                              attrs={'data-type': 'size'},
-                              filters=(sizeformat.diskgbformat,))
-    disk_reserved = tables.Column("disk_gb_reserved",
-                                  verbose_name=_("Storage reserved"),
-                                  attrs={'data-type': 'size'},
-                                  filters=(sizeformat.diskgbformat,))
-    disk = tables.Column("disk_gb",
-                         verbose_name=_("Storage total"),
-                         attrs={'data-type': 'size'},
-                         filters=(sizeformat.diskgbformat,))
-    disk_ar = tables.Column("disk_gb_ar",
-                            verbose_name=_("Storage allocation ratio"))
-
-    def get_object_id(self, provider):
-        return provider['uuid']
-
-    class Meta(object):
-        name = "providers"
-        verbose_name = _("Resource Providers")
