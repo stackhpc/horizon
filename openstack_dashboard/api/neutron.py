@@ -1838,6 +1838,8 @@ def subnetpool_delete(request, subnetpool_id):
 @memoized
 def port_list(request, **params):
     LOG.debug("port_list(): params=%s", params)
+    if 'tenant_id' in params:
+        params['project_id'] = params.pop('tenant_id')
     ports = networkclient(request).ports(**params)
     if not isinstance(ports, (types.GeneratorType, list)):
         ports = [ports]
@@ -1863,6 +1865,9 @@ def port_list_with_trunk_types(request, **params):
     # trunk information and port_list() is enough.
     if not is_extension_supported(request, 'trunk'):
         return port_list(request, **params)
+
+    if 'tenant_id' in params:
+        params['project_id'] = params.pop('tenant_id')
 
     ports = networkclient(request).ports(**params)
     trunk_filters = {}
