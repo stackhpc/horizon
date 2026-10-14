@@ -79,6 +79,33 @@ class VolumeTableMixIn(object):
                                 "attachment information"))
             return []
 
+    def _get_attached_instances(self, instance_ids):
+        """Fetch only the servers attached to the listed volumes.
+
+        Listing every server (for an admin: of every project) to name a
+        page of attachments takes seconds on a large cloud.
+        """
+        def _get(server_id):
+            try:
+                return nova.server_get(self.request, server_id)
+            except Exception:
+                # Deleted, or not visible to this user: the attachment is
+                # shown without an instance name, as before.
+                return None
+
+        ids = sorted(set(instance_ids))
+        instances = []
+        for start in range(0, len(ids), 10):
+            batch = ids[start:start + 10]
+            instances.extend(s for s in futurist_utils.call_functions_parallel(
+                *[(_get, [server_id]) for server_id in batch]) if s)
+        # In volumes tab we don't need to know about the assignment
+        # instance-image, therefore fixing it to an empty value
+        for instance in instances:
+            if isinstance(getattr(instance, 'image', None), dict):
+                instance.image['name'] = "-"
+        return instances
+
     def _get_volumes_ids_with_snapshots(self, search_opts=None):
         try:
             volume_ids = []
@@ -156,19 +183,8 @@ class VolumesView(tables.PagedTableMixin, VolumeTableMixIn,
             volumes.extend(self._get_volumes(search_opts=filters))
             attached_instance_ids.extend(
                 self._get_attached_instance_ids(volumes))
-
-        def _task_get_instances():
-            # As long as Nova API does not allow passing attached_instance_ids
-            # to nova.server_list, this call can be forged to pass anything
-            # != None
-            instances.extend(self._get_instances())
-
-            # In volumes tab we don't need to know about the assignment
-            # instance-image, therefore fixing it to an empty value
-            for instance in instances:
-                if hasattr(instance, 'image'):
-                    if isinstance(instance.image, dict):
-                        instance.image['name'] = "-"
+            instances.extend(
+                self._get_attached_instances(attached_instance_ids))
 
         def _task_get_volumes_snapshots():
             volume_ids_with_snapshots.extend(
@@ -176,7 +192,6 @@ class VolumesView(tables.PagedTableMixin, VolumeTableMixIn,
 
         futurist_utils.call_functions_parallel(
             _task_get_volumes,
-            _task_get_instances,
             _task_get_volumes_snapshots)
 
         self._set_volume_attributes(
@@ -214,9 +229,27 @@ class DetailView(tabs.TabbedTableView):
                 self.request, search_opts=search_opts)
             if snapshots:
                 setattr(volume, 'has_snapshot', True)
+            # Resolve attached instance objects in a single batched call
+            # rather than one server_get() per attachment (was N+1 on
+            # multi-attached volumes).
+            attached_ids = [att['server_id'] for att in volume.attachments]
+            instance_map = {}
+            if attached_ids:
+                try:
+                    servers, _more = nova.server_list(
+                        self.request,
+                        search_opts={'uuid': attached_ids,
+                                     'all_tenants': False})
+                    instance_map = {s.id: s for s in servers}
+                except Exception:
+                    # Fall back to per-attachment lookup if filtered list
+                    # is unsupported by the deployed nova microversion.
+                    instance_map = {
+                        sid: nova.server_get(self.request, sid)
+                        for sid in attached_ids
+                    }
             for att in volume.attachments:
-                att['instance'] = nova.server_get(self.request,
-                                                  att['server_id'])
+                att['instance'] = instance_map.get(att['server_id'])
             if getattr(volume, 'group_id', None):
                 volume.group = cinder.group_get(self.request, volume.group_id)
             else:

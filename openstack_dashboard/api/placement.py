@@ -10,6 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from concurrent import futures
+
 from django.conf import settings
 from keystoneauth1 import adapter
 from keystoneauth1 import identity
@@ -17,6 +19,7 @@ from keystoneauth1 import session
 
 from openstack_dashboard.api import base
 
+from horizon.utils.cached import cached_api
 from horizon.utils.memoized import memoized
 
 
@@ -96,19 +99,35 @@ def resource_provider_traits(request, uuid):
     return _get_json(request, f'/resource_providers/{uuid}/traits')['traits']
 
 
+# Four placement calls per resource provider; run them in parallel.
+_PROVIDER_DETAIL_WORKERS = 16
+
+
+def _provider_details(request, uuid):
+    return (resource_provider_inventories(request, uuid),
+            resource_provider_usages(request, uuid),
+            resource_provider_aggregates(request, uuid),
+            resource_provider_traits(request, uuid))
+
+
+@cached_api(ttl=60, scope=('token',))
+@memoized
 def get_providers(request):
     providers = resource_providers(request)
-    for p in providers:
-        inventories = resource_provider_inventories(request, p['uuid'])
-        usages = resource_provider_usages(request, p['uuid'])
+    workers = min(_PROVIDER_DETAIL_WORKERS, max(1, len(providers)))
+    with futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        details = list(executor.map(
+            lambda p: _provider_details(request, p['uuid']), providers))
+    for p, (inventories, usages, aggregates, traits) in zip(providers,
+                                                             details):
         vcpus = inventories.get('VCPU')
         pcpus = inventories.get('PCPU')
         memory = inventories.get('MEMORY_MB')
         disk = inventories.get('DISK_GB')
         p['inventories'] = inventories
         p['usages'] = usages
-        p['aggregates'] = resource_provider_aggregates(request, p['uuid'])
-        p['traits'] = resource_provider_traits(request, p['uuid'])
+        p['aggregates'] = aggregates
+        p['traits'] = traits
 
         p['vcpus_used'] = usages.get('VCPU')
         # Reserved:

@@ -134,6 +134,12 @@ def _get_enforcer():
                 LOG.warning("Cannot load a policy file '%s' for service '%s' "
                             "due to ValueError. The file might be wrongly "
                             "formatted.", policy_file, service)
+            else:
+                # enforce() calls load_rules() on every check, which stats
+                # the policy files and directories each time (thousands of
+                # times on a long table). The files only change on a
+                # redeploy, which restarts horizon.
+                enforcer.use_conf = False
 
             # Ensure enforcer.rules is populated.
             if enforcer.rules:

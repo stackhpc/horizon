@@ -31,6 +31,7 @@ from cinderclient import exceptions as cinder_exception
 from cinderclient.v3.contrib import list_extensions as cinder_list_extensions
 
 from horizon import exceptions
+from horizon.utils.cached import bump_versions, cached_api, ProcessTTLCache
 from horizon.utils.memoized import memoized
 
 from openstack_dashboard.api import _nova
@@ -250,6 +251,24 @@ def cinderclient(request, version=None):
     return c
 
 
+# Cinder's microversion range per endpoint. Without this every
+# get_microversion() call (several per page, the panel checks included) is
+# a GET on the cinder root.
+_server_versions = ProcessTTLCache(600)
+
+
+def _get_server_version(cinder_url, insecure, cacert):
+    versions = _server_versions.get(cinder_url)
+    if versions is None:
+        versions = cinder_client.get_server_version(cinder_url,
+                                                    insecure, cacert)
+        # cinderclient falls back to 2.0/2.0 when the endpoint does not
+        # answer; do not keep that.
+        if versions[1].ver_major >= 3:
+            _server_versions.set(cinder_url, versions)
+    return versions
+
+
 def get_microversion(request, features):
     try:
         version, cinder_url = _find_cinder_url(request)
@@ -259,8 +278,7 @@ def get_microversion(request, features):
     insecure = settings.OPENSTACK_SSL_NO_VERIFY
     cacert = settings.OPENSTACK_SSL_CACERT
 
-    min_ver, max_ver = cinder_client.get_server_version(cinder_url,
-                                                        insecure, cacert)
+    min_ver, max_ver = _get_server_version(cinder_url, insecure, cacert)
     return microversions.get_microversion_for_features(
         'cinder', features, api_versions.APIVersion, min_ver, max_ver)
 
@@ -293,6 +311,9 @@ def version_get():
     return api_version['version']
 
 
+_VOLUME_VERSIONS = ('volume:project',)
+
+
 def volume_list(request, search_opts=None, marker=None, sort_dir="desc"):
     volumes, _, __ = volume_list_paged(
         request, search_opts=search_opts, marker=marker, paginate=False,
@@ -320,6 +341,11 @@ def update_pagination(entities, page_size, marker, sort_dir):
     return entities, has_more_data, has_prev_data
 
 
+@cached_api(
+    ttl=60,
+    scope=('token', 'project'),
+    versions=_VOLUME_VERSIONS,
+)
 @profiler.trace
 def volume_list_paged(request, search_opts=None, marker=None, paginate=False,
                       sort_dir="desc"):
@@ -405,6 +431,7 @@ def volume_create(request, size, name, description, volume_type,
             'group_id': group_id}
 
     volume = client.volumes.create(size, **data)
+    bump_versions(request, _VOLUME_VERSIONS)
     return Volume(volume)
 
 
@@ -412,33 +439,43 @@ def volume_create(request, size, name, description, volume_type,
 def volume_extend(request, volume_id, new_size):
     client = _cinderclient_with_features(request,
                                          'extend_in_use_volume')
-    return client.volumes.extend(volume_id, new_size)
+    result = client.volumes.extend(volume_id, new_size)
+    bump_versions(request, _VOLUME_VERSIONS)
+    return result
 
 
 @profiler.trace
 def volume_delete(request, volume_id):
-    return cinderclient(request).volumes.delete(volume_id)
+    result = cinderclient(request).volumes.delete(volume_id)
+    bump_versions(request, _VOLUME_VERSIONS)
+    return result
 
 
 @profiler.trace
 def volume_retype(request, volume_id, new_type, migration_policy):
-    return cinderclient(request).volumes.retype(volume_id,
-                                                new_type,
-                                                migration_policy)
+    result = cinderclient(request).volumes.retype(volume_id,
+                                                  new_type,
+                                                  migration_policy)
+    bump_versions(request, _VOLUME_VERSIONS)
+    return result
 
 
 @profiler.trace
 def volume_set_bootable(request, volume_id, bootable):
-    return cinderclient(request).volumes.set_bootable(volume_id,
-                                                      bootable)
+    result = cinderclient(request).volumes.set_bootable(volume_id,
+                                                        bootable)
+    bump_versions(request, _VOLUME_VERSIONS)
+    return result
 
 
 @profiler.trace
 def volume_update(request, volume_id, name, description):
     vol_data = {'name': name,
                 'description': description}
-    return cinderclient(request).volumes.update(volume_id,
-                                                **vol_data)
+    result = cinderclient(request).volumes.update(volume_id,
+                                                  **vol_data)
+    bump_versions(request, _VOLUME_VERSIONS)
+    return result
 
 
 @profiler.trace
@@ -495,6 +532,14 @@ def volume_snapshot_list(request, search_opts=None):
     return snapshots
 
 
+_SNAPSHOT_VERSIONS = ('snapshot:project',)
+
+
+@cached_api(
+    ttl=60,
+    scope=('token', 'project'),
+    versions=_SNAPSHOT_VERSIONS,
+)
 @profiler.trace
 def volume_snapshot_list_paged(request, search_opts=None, marker=None,
                                paginate=False, sort_dir="desc"):
@@ -533,13 +578,17 @@ def volume_snapshot_create(request, volume_id, name,
             'description': description,
             'force': force}
 
-    return VolumeSnapshot(cinderclient(request).volume_snapshots.create(
+    result = VolumeSnapshot(cinderclient(request).volume_snapshots.create(
         volume_id, **data))
+    bump_versions(request, _SNAPSHOT_VERSIONS)
+    return result
 
 
 @profiler.trace
 def volume_snapshot_delete(request, snapshot_id):
-    return cinderclient(request).volume_snapshots.delete(snapshot_id)
+    result = cinderclient(request).volume_snapshots.delete(snapshot_id)
+    bump_versions(request, _SNAPSHOT_VERSIONS)
+    return result
 
 
 @profiler.trace
@@ -788,6 +837,14 @@ def default_quota_update(request, **kwargs):
     cinderclient(request).quota_classes.update(DEFAULT_QUOTA_NAME, **kwargs)
 
 
+_VOLUME_TYPE_VERSIONS = ('volumetype:global',)
+
+
+@cached_api(
+    ttl=1800,
+    scope=('token',),
+    versions=_VOLUME_TYPE_VERSIONS,
+)
 @profiler.trace
 def volume_type_list(request):
     return cinderclient(request).volume_types.list()
@@ -795,17 +852,21 @@ def volume_type_list(request):
 
 @profiler.trace
 def volume_type_create(request, name, description=None, is_public=True):
-    return cinderclient(request).volume_types.create(name, description,
-                                                     is_public)
+    result = cinderclient(request).volume_types.create(name, description,
+                                                       is_public)
+    bump_versions(request, _VOLUME_TYPE_VERSIONS)
+    return result
 
 
 @profiler.trace
 def volume_type_update(request, volume_type_id, name=None, description=None,
                        is_public=None):
-    return cinderclient(request).volume_types.update(volume_type_id,
-                                                     name,
-                                                     description,
-                                                     is_public)
+    result = cinderclient(request).volume_types.update(volume_type_id,
+                                                       name,
+                                                       description,
+                                                       is_public)
+    bump_versions(request, _VOLUME_TYPE_VERSIONS)
+    return result
 
 
 @profiler.trace
@@ -817,7 +878,9 @@ def volume_type_default(request):
 @profiler.trace
 def volume_type_delete(request, volume_type_id):
     try:
-        return cinderclient(request).volume_types.delete(volume_type_id)
+        result = cinderclient(request).volume_types.delete(volume_type_id)
+        bump_versions(request, _VOLUME_TYPE_VERSIONS)
+        return result
     except cinder_exception.BadRequest:
         raise exceptions.BadRequest(_(
             "This volume type is used by one or more volumes."))
@@ -967,6 +1030,10 @@ def service_list(request):
     return cinderclient(request).services.list()
 
 
+@cached_api(
+    ttl=3600,
+    scope=('token', 'project'),
+)
 @profiler.trace
 def availability_zone_list(request, detailed=False):
     return cinderclient(request).availability_zones.list(detailed=detailed)
@@ -1133,6 +1200,14 @@ def group_type_spec_unset(request, group_type_id, keys):
     return group_type._apiresource.unset_keys(keys)
 
 
+_GROUP_VERSIONS = ('group:project',)
+
+
+@cached_api(
+    ttl=300,
+    scope=('token', 'project'),
+    versions=_GROUP_VERSIONS,
+)
 @profiler.trace
 def group_list(request, search_opts=None):
     client = _cinderclient_with_generic_groups(request)
@@ -1186,7 +1261,9 @@ def group_create(request, name, group_type, volume_types,
         params['description'] = description
     if availability_zone is not None:
         params['availability_zone'] = availability_zone
-    return Group(client.groups.create(**params))
+    result = Group(client.groups.create(**params))
+    bump_versions(request, _GROUP_VERSIONS)
+    return result
 
 
 @profiler.trace
@@ -1194,15 +1271,18 @@ def group_create_from_source(request, name, group_snapshot_id=None,
                              source_group_id=None, description=None,
                              user_id=None, project_id=None):
     client = _cinderclient_with_generic_groups(request)
-    return Group(client.groups.create_from_src(
+    result = Group(client.groups.create_from_src(
         group_snapshot_id, source_group_id, name, description,
         user_id, project_id))
+    bump_versions(request, _GROUP_VERSIONS)
+    return result
 
 
 @profiler.trace
 def group_delete(request, group_id, delete_volumes=False):
     client = _cinderclient_with_generic_groups(request)
     client.groups.delete(group_id, delete_volumes)
+    bump_versions(request, _GROUP_VERSIONS)
 
 
 @profiler.trace

@@ -118,6 +118,16 @@ class AdminIndexView(tables.PagedTableMixin, tables.DataTableView):
             exceptions.handle(self.request, ignore=True)
             return {}
 
+    def _get_images_for(self, instances, volume_dict):
+        # Only the images of the listed instances, not the whole catalogue.
+        try:
+            return views.get_images_by_ids(
+                self.request,
+                views.image_ids_for_instances(instances, volume_dict))
+        except Exception:
+            exceptions.handle(self.request, ignore=True)
+            return {}
+
     def _get_images_by_name(self, image_name):
         result = api.glance.image_list_detailed(
             self.request, filters={'name': image_name})
@@ -177,11 +187,10 @@ class AdminIndexView(tables.PagedTableMixin, tables.DataTableView):
         self._needs_filter_first = False
 
         results = futurist_utils.call_functions_parallel(
-            self._get_images,
             self._get_volumes,
             self._get_flavors,
             self._get_tenants)
-        image_dict, volume_dict, flavor_dict, tenant_dict = results
+        volume_dict, flavor_dict, tenant_dict = results
 
         non_api_filter_info = [
             ('project', 'tenant_id', tenant_dict.values()),
@@ -202,7 +211,7 @@ class AdminIndexView(tables.PagedTableMixin, tables.DataTableView):
         instances = self._get_instances(search_opts, sort_dir)
 
         if not filter_by_image_name:
-            image_dict = self._get_images()
+            image_dict = self._get_images_for(instances, volume_dict)
 
         # Loop through instances to get image, flavor and tenant info.
         for inst in instances:

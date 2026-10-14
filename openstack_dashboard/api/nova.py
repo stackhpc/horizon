@@ -30,11 +30,13 @@ from novaclient.v2 import instance_action as nova_instance_action
 from novaclient.v2 import servers as nova_servers
 
 from horizon import exceptions as horizon_exceptions
+from horizon.utils.cached import bump_versions, cached_api
 from horizon.utils import memoized
 
 from openstack_dashboard.api import _nova
 from openstack_dashboard.api import base
 from openstack_dashboard.api import cinder
+from openstack_dashboard.api import glance
 from openstack_dashboard.contrib.developer.profiler import api as profiler
 from openstack_dashboard.utils import settings as utils
 
@@ -229,6 +231,9 @@ def server_mks_console(request, instance_id):
     return MKSConsole(console['remote_console'])
 
 
+_FLAVOR_VERSIONS = ('flavor:global',)
+
+
 @profiler.trace
 def flavor_create(request, name, memory, vcpu, disk, flavorid='auto',
                   ephemeral=0, swap=0, metadata=None, is_public=True,
@@ -241,12 +246,14 @@ def flavor_create(request, name, memory, vcpu, disk, flavorid='auto',
                                                       rxtx_factor=rxtx_factor)
     if (metadata):
         flavor_extra_set(request, flavor.id, metadata)
+    bump_versions(request, _FLAVOR_VERSIONS)
     return flavor
 
 
 @profiler.trace
 def flavor_delete(request, flavor_id):
     _nova.novaclient(request).flavors.delete(flavor_id)
+    bump_versions(request, _FLAVOR_VERSIONS)
 
 
 @profiler.trace
@@ -257,6 +264,11 @@ def flavor_get(request, flavor_id, get_extras=False):
     return flavor
 
 
+@cached_api(
+    ttl=1800,
+    scope=('token', 'project'),
+    versions=_FLAVOR_VERSIONS,
+)
 @profiler.trace
 @memoized.memoized
 def flavor_list(request, is_public=None, get_extras=False):
@@ -373,28 +385,45 @@ def flavor_extra_set(request, flavor_id, metadata):
 
 @profiler.trace
 def snapshot_create(request, instance_id, name):
-    return _nova.novaclient(request).servers.create_image(instance_id, name)
+    image_id = _nova.novaclient(request).servers.create_image(instance_id,
+                                                               name)
+    # The snapshot is a new glance image.
+    bump_versions(request, glance._IMAGE_VERSIONS)
+    return image_id
+
+
+_KEYPAIR_VERSIONS = ('keypair:user',)
 
 
 @profiler.trace
 def keypair_create(request, name, key_type='ssh'):
     microversion = get_microversion(request, 'key_types')
-    return _nova.novaclient(request, microversion).\
+    result = _nova.novaclient(request, microversion).\
         keypairs.create(name, key_type=key_type)
+    bump_versions(request, _KEYPAIR_VERSIONS)
+    return result
 
 
 @profiler.trace
 def keypair_import(request, name, public_key, key_type='ssh'):
     microversion = get_microversion(request, 'key_types')
-    return _nova.novaclient(request, microversion).\
+    result = _nova.novaclient(request, microversion).\
         keypairs.create(name, public_key, key_type)
+    bump_versions(request, _KEYPAIR_VERSIONS)
+    return result
 
 
 @profiler.trace
 def keypair_delete(request, name):
     _nova.novaclient(request).keypairs.delete(name)
+    bump_versions(request, _KEYPAIR_VERSIONS)
 
 
+@cached_api(
+    ttl=1800,
+    scope=('token', 'user'),
+    versions=_KEYPAIR_VERSIONS,
+)
 @profiler.trace
 def keypair_list(request):
     microversion = get_microversion(request, 'key_type_list')
@@ -434,7 +463,7 @@ def server_create(request, name, image, flavor, key_name, user_data,
     if description is not None:
         kwargs['description'] = description
 
-    return Server(nova_client.servers.create(
+    result = Server(nova_client.servers.create(
         name.strip(), image, flavor, userdata=user_data,
         security_groups=security_groups,
         key_name=key_name, block_device_mapping=block_device_mapping,
@@ -443,11 +472,14 @@ def server_create(request, name, image, flavor, key_name, user_data,
         min_count=instance_count, admin_pass=admin_pass,
         disk_config=disk_config, config_drive=config_drive,
         meta=meta, scheduler_hints=scheduler_hints, **kwargs), request)
+    bump_versions(request, _SERVER_VERSIONS)
+    return result
 
 
 @profiler.trace
 def server_delete(request, instance_id):
     _nova.novaclient(request).servers.delete(instance_id)
+    bump_versions(request, _SERVER_VERSIONS)
     # Session is available and consistent for the current view
     # among Horizon django servers even in load-balancing setup,
     # so only the view listing the servers will recognize it as
@@ -533,6 +565,20 @@ def server_list_paged(request,
     return (servers, has_more_data, has_prev_data)
 
 
+_SERVER_VERSIONS = ('server:project', 'server:global')
+
+
+# Short TTL — server status changes during boot/build/active transitions.
+# Pagination through ``server_list_paged`` stays uncached so the project
+# instances list stays live for status polling. Only the unpaged
+# ``server_list`` (used by admin volumes/floating-ips/etc. to look up
+# names) benefits from caching, and 10s is short enough that a user
+# refreshing after CLI-creating a VM sees it within a click.
+@cached_api(
+    ttl=10,
+    scope=('token', 'project'),
+    versions=_SERVER_VERSIONS,
+)
 @profiler.trace
 def server_list(request, search_opts=None, detailed=True):
     (servers, has_more_data, _) = server_list_paged(request,
@@ -734,6 +780,9 @@ def _merge_usage_list(usages, next_usage_list):
             usages[next_usage.tenant_id] = next_usage
 
 
+# Usage over the selected period (day granularity); computing it in nova
+# takes seconds on a large cloud.
+@cached_api(ttl=300, scope=('authz',))
 @profiler.trace
 def usage_get(request, tenant_id, start, end):
     client = upgrade_api(request, _nova.novaclient(request), '2.40')
@@ -751,6 +800,7 @@ def usage_get(request, tenant_id, start, end):
     return NovaUsage(usage)
 
 
+@cached_api(ttl=300, scope=('authz',))
 @profiler.trace
 def usage_list(request, start, end):
     client = upgrade_api(request, _nova.novaclient(request), '2.40')
@@ -791,14 +841,18 @@ def instance_volume_attach(request, volume_id, instance_id, device):
                 _('Multiattach volumes are not yet supported.'))
     else:
         client = _nova.novaclient(request)
-    return client.volumes.create_server_volume(
+    result = client.volumes.create_server_volume(
         instance_id, volume_id, device)
+    bump_versions(request, ('volume:project',))
+    return result
 
 
 @profiler.trace
 def instance_volume_detach(request, instance_id, att_id):
-    return _nova.novaclient(request).volumes.delete_server_volume(instance_id,
-                                                                  att_id)
+    result = _nova.novaclient(request).volumes.delete_server_volume(
+        instance_id, att_id)
+    bump_versions(request, ('volume:project',))
+    return result
 
 
 @profiler.trace
@@ -916,6 +970,10 @@ def tenant_absolute_limits(request, reserved=False, tenant_id=None):
     return limits_dict
 
 
+@cached_api(
+    ttl=3600,
+    scope=('token', 'project'),
+)
 @profiler.trace
 def availability_zone_list(request, detailed=False):
     nc = _nova.novaclient(request)

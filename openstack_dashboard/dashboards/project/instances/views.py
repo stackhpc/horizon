@@ -60,6 +60,54 @@ from openstack_dashboard.views import get_url_with_pagination
 
 LOG = logging.getLogger(__name__)
 
+# Image ids per glance list call; keeps the URL short.
+_IMAGE_ID_CHUNK = 40
+
+
+def image_ids_for_instances(instances, volume_dict):
+    """Ids of the images shown for ``instances``: the image of an
+    image-backed instance, or the source image of a volume-backed
+    instance's boot volume (first attachment by device name)."""
+    attachments = {}
+    for volume in volume_dict.values():
+        for attachment in getattr(volume, 'attachments', None) or []:
+            attachments.setdefault(attachment.get('server_id'), []).append(
+                (attachment.get('device') or '', volume))
+    ids = set()
+    for instance in instances:
+        image = getattr(instance, 'image', None)
+        if isinstance(image, dict):
+            if image.get('id'):
+                ids.add(image['id'])
+            continue
+        boot = sorted(attachments.get(instance.id, []), key=lambda a: a[0])
+        if boot:
+            metadata = getattr(boot[0][1], 'volume_image_metadata', None)
+            if (metadata or {}).get('image_id'):
+                ids.add(metadata['image_id'])
+    return ids
+
+
+def get_images_by_ids(request, image_ids):
+    """Fetch the given images only, instead of the whole image catalogue.
+
+    Community images are only listed when asked for explicitly, so ids not
+    found in the default listing are looked up once more with
+    ``visibility=community``.
+    """
+    image_map = {}
+    for visibility in (None, 'community'):
+        missing = sorted(i for i in image_ids if i not in image_map)
+        for start in range(0, len(missing), _IMAGE_ID_CHUNK):
+            id_filter = {
+                'id': 'in:' + ','.join(missing[start:start + _IMAGE_ID_CHUNK])}
+            if visibility:
+                id_filter['visibility'] = visibility
+            images = api.glance.image_list_detailed(
+                request, filters=id_filter)[0]
+            image_map.update((image.id, image) for image in images)
+    return image_map
+
 
 class IndexView(tables.PagedTableMixin, tables.DataTableView):
     table_class = project_tables.InstancesTable
@@ -148,17 +196,34 @@ class IndexView(tables.PagedTableMixin, tables.DataTableView):
             exceptions.handle(self.request, ignore=True)
             return {}
 
+    def _get_images_for(self, instances, volume_dict):
+        try:
+            return get_images_by_ids(
+                self.request, image_ids_for_instances(instances, volume_dict))
+        except Exception:
+            exceptions.handle(self.request, ignore=True)
+            return {}
+
     def get_data(self):
         marker, sort_dir = self._get_marker()
         search_opts = self.get_filters({'marker': marker, 'paginate': True})
 
-        image_dict, flavor_dict, volume_dict = \
-            futurist_utils.call_functions_parallel(
-                self._get_images, self._get_flavors, self._get_volumes
-            )
+        # Only a filter by image name needs the whole image catalogue; the
+        # table itself needs just the images of the listed instances.
+        if 'image_name' in search_opts:
+            image_dict, flavor_dict, volume_dict = \
+                futurist_utils.call_functions_parallel(
+                    self._get_images, self._get_flavors, self._get_volumes
+                )
+        else:
+            image_dict = None
+            flavor_dict, volume_dict = \
+                futurist_utils.call_functions_parallel(
+                    self._get_flavors, self._get_volumes
+                )
 
         non_api_filter_info = (
-            ('image_name', 'image', image_dict.values()),
+            ('image_name', 'image', (image_dict or {}).values()),
             ('flavor_name', 'flavor', flavor_dict.values()),
         )
         if not process_non_api_filters(search_opts, non_api_filter_info):
@@ -166,6 +231,8 @@ class IndexView(tables.PagedTableMixin, tables.DataTableView):
             return []
 
         instances = self._get_instances(search_opts, sort_dir)
+        if image_dict is None:
+            image_dict = self._get_images_for(instances, volume_dict)
 
         # Loop through instances to get flavor info.
         for instance in instances:

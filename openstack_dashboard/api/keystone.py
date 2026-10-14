@@ -32,6 +32,7 @@ from openstack_auth import backend
 from openstack_auth import utils as auth_utils
 
 from horizon import exceptions
+from horizon.utils.cached import bump_versions, cached_api
 
 from openstack_dashboard.api import base
 from openstack_dashboard.contrib.developer.profiler import api as profiler
@@ -252,14 +253,19 @@ def domain_update(request, domain_id, name=None, description=None,
     return response
 
 
+_TENANT_VERSIONS = ('tenant:domain', 'tenant:global')
+
+
 @profiler.trace
 def tenant_create(request, name, description=None, enabled=None,
                   domain=None, **kwargs):
     manager = VERSIONS.get_project_manager(request, admin=True)
     try:
-        return manager.create(name, domain,
-                              description=description,
-                              enabled=enabled, **kwargs)
+        result = manager.create(name, domain,
+                                description=description,
+                                enabled=enabled, **kwargs)
+        bump_versions(request, _TENANT_VERSIONS)
+        return result
     except keystone_exceptions.Conflict:
         raise exceptions.Conflict()
 
@@ -345,8 +351,14 @@ def tenant_get(request, project, admin=True):
 def tenant_delete(request, project):
     manager = VERSIONS.get_project_manager(request, admin=True)
     manager.delete(project)
+    bump_versions(request, _TENANT_VERSIONS)
 
 
+@cached_api(
+    ttl=600,
+    scope=('token', 'user'),
+    versions=_TENANT_VERSIONS,
+)
 @profiler.trace
 def tenant_list(request, paginate=False, marker=None, domain=None, user=None,
                 admin=True, filters=None):
@@ -383,8 +395,10 @@ def tenant_update(request, project, name=None, description=None,
                   enabled=None, domain=None, **kwargs):
     manager = VERSIONS.get_project_manager(request, admin=True)
     try:
-        return manager.update(project, name=name, description=description,
-                              enabled=enabled, domain=domain, **kwargs)
+        result = manager.update(project, name=name, description=description,
+                                enabled=enabled, domain=domain, **kwargs)
+        bump_versions(request, _TENANT_VERSIONS)
+        return result
     except keystone_exceptions.Conflict:
         raise exceptions.Conflict()
 

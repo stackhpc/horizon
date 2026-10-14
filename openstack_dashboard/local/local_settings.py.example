@@ -20,7 +20,7 @@ from horizon.utils import secret_key
 
 from openstack_dashboard.settings import HORIZON_CONFIG
 
-DEBUG = True
+DEBUG = False
 
 # This setting controls whether or not compression is enabled. Disabling
 # compression makes Horizon considerably slower, but makes it much easier

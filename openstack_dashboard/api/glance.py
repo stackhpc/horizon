@@ -34,6 +34,7 @@ from glanceclient.v2 import client
 
 
 from horizon import messages
+from horizon.utils.cached import bump_versions, cached_api
 from horizon.utils.memoized import memoized
 from openstack_dashboard.api import base
 from openstack_dashboard.contrib.developer.profiler import api as profiler
@@ -172,9 +173,14 @@ def _normalize_list_input(filters, **kwargs):
     _normalize_owner_id_filter(filters)
 
 
+_IMAGE_VERSIONS = ('image:project', 'image:global')
+
+
 @profiler.trace
 def image_delete(request, image_id):
-    return glanceclient(request).images.delete(image_id)
+    result = glanceclient(request).images.delete(image_id)
+    bump_versions(request, _IMAGE_VERSIONS)
+    return result
 
 
 @profiler.trace
@@ -187,15 +193,28 @@ def image_get(request, image_id):
 @profiler.trace
 def image_deactivate(request, image_id):
     """Deactivates an Image"""
-    return glanceclient(request).images.deactivate(image_id)
+    result = glanceclient(request).images.deactivate(image_id)
+    bump_versions(request, _IMAGE_VERSIONS)
+    return result
 
 
 @profiler.trace
 def image_reactivate(request, image_id):
     """Reactivates an Image"""
-    return glanceclient(request).images.reactivate(image_id)
+    result = glanceclient(request).images.reactivate(image_id)
+    bump_versions(request, _IMAGE_VERSIONS)
+    return result
 
 
+# Shared between tokens of the same project and role set: what glance lists
+# depends on nothing else, and a large catalogue (1000+ images) costs
+# several seconds per fetch. Images created outside horizon (CLI, API)
+# show up after the TTL at the latest.
+@cached_api(
+    ttl=600,
+    scope=('authz',),
+    versions=('image:project', 'image:global'),
+)
 @profiler.trace
 def image_list_detailed(request, marker=None, sort_dir='desc',
                         sort_key='created_at', filters=None, paginate=False,
@@ -307,8 +326,10 @@ def image_list_detailed(request, marker=None, sort_dir='desc',
 def image_update(request, image_id, **kwargs):
     image_data = kwargs.get('data', None)
     try:
-        return Image(glanceclient(request).images.update(
+        result = Image(glanceclient(request).images.update(
             image_id, **kwargs))
+        bump_versions(request, _IMAGE_VERSIONS)
+        return result
     finally:
         if image_data:
             try:
@@ -474,6 +495,7 @@ def image_create(request, **kwargs):
     image = glanceclient(request).images.create(**kwargs)
     if location is not None:
         glanceclient(request).images.add_location(image.id, location, {})
+    bump_versions(request, _IMAGE_VERSIONS)
 
     if data:
         if isinstance(data, str):
@@ -514,15 +536,19 @@ def image_create(request, **kwargs):
 @profiler.trace
 def image_update_properties(request, image_id, remove_props=None, **kwargs):
     """Add or update a custom property of an image."""
-    return glanceclient(request).images.update(image_id,
-                                               remove_props,
-                                               **kwargs)
+    result = glanceclient(request).images.update(image_id,
+                                                 remove_props,
+                                                 **kwargs)
+    bump_versions(request, _IMAGE_VERSIONS)
+    return result
 
 
 @profiler.trace
 def image_delete_properties(request, image_id, keys):
     """Delete custom properties for an image."""
-    return glanceclient(request, '2').images.update(image_id, keys)
+    result = glanceclient(request, '2').images.update(image_id, keys)
+    bump_versions(request, _IMAGE_VERSIONS)
+    return result
 
 
 class BaseGlanceMetadefAPIResourceWrapper(base.APIResourceWrapper):

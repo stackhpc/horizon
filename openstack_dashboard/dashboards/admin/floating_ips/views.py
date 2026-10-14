@@ -27,6 +27,7 @@ from horizon.utils import memoized
 from horizon import views
 
 from openstack_dashboard import api
+from openstack_dashboard.utils import futurist_utils
 
 from openstack_dashboard.dashboards.admin.floating_ips \
     import forms as fip_forms
@@ -61,6 +62,46 @@ class IndexView(tables.DataTableView):
     table_class = fip_tables.FloatingIPsTable
     page_title = _("Floating IPs")
 
+    # Up to this many servers are fetched one by one (in parallel batches);
+    # above it one list of all servers is cheaper.
+    _SERVER_LOOKUP_MAX = 50
+
+    def _get_instance_names(self, instance_ids):
+        """Names of the servers the floating IPs are associated with.
+
+        Listing every server of every project only to name a few takes
+        seconds on a large cloud.
+        """
+        ids = sorted(set(instance_ids))
+        if not ids:
+            return {}
+        try:
+            if len(ids) > self._SERVER_LOOKUP_MAX:
+                instances, has_more = api.nova.server_list(
+                    self.request,
+                    search_opts={'all_tenants': True},
+                    detailed=False)
+                return dict((obj.id, obj.name) for obj in instances)
+
+            def _get(server_id):
+                try:
+                    return api.nova.server_get(self.request, server_id)
+                except Exception:
+                    # Deleted, or not a server: shown without a name.
+                    return None
+
+            names = {}
+            for start in range(0, len(ids), 10):
+                for server in futurist_utils.call_functions_parallel(
+                        *[(_get, [i]) for i in ids[start:start + 10]]):
+                    if server:
+                        names[server.id] = server.name
+            return names
+        except Exception:
+            exceptions.handle(self.request,
+                              _('Unable to retrieve instance list.'))
+            return {}
+
     @memoized.memoized_method
     def get_data(self):
         floating_ips = []
@@ -75,17 +116,9 @@ class IndexView(tables.DataTableView):
                               _('Unable to retrieve floating IP list.'))
 
         if floating_ips:
-            instances = []
-            try:
-                instances, has_more = api.nova.server_list(
-                    self.request,
-                    search_opts={'all_tenants': True},
-                    detailed=False)
-            except Exception:
-                exceptions.handle(
-                    self.request,
-                    _('Unable to retrieve instance list.'))
-            instances_dict = dict((obj.id, obj.name) for obj in instances)
+            instances_dict = self._get_instance_names(
+                [ip.instance_id for ip in floating_ips
+                 if ip.instance_id and ip.instance_type == 'compute'])
 
             tenants = get_tenant_list(self.request)
             tenant_dict = OrderedDict([(t.id, t) for t in tenants])

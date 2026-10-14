@@ -28,6 +28,7 @@ import netaddr
 
 from django.conf import settings
 from django.utils.translation import gettext_lazy as _
+from horizon.utils.cached import bump_versions, cached_api, ProcessTTLCache
 from keystoneauth1 import exceptions as ks_exceptions
 from keystoneauth1 import session
 from keystoneauth1 import token_endpoint
@@ -36,6 +37,7 @@ from neutronclient.v2_0 import client as neutron_client
 from novaclient import exceptions as nova_exc
 import openstack
 from openstack import exceptions as sdk_exceptions
+from openstack.network.v2 import network as sdk_network
 import requests
 
 from openstack_auth import utils as auth_utils
@@ -749,15 +751,25 @@ class FloatingIpManager(object):
         else:
             port_search_opts = {}
         fips = list(self.net_client.ips(**search_opts))
-        # Get port list to add instance_id to floating IP list
-        # instance_id is stored in device_id attribute
-        ports = port_list(self.request, **port_search_opts)
-        port_dict = collections.OrderedDict([(p['id'], p) for p in ports])
         fips_list = []
         for fip in fips:
             fips_list.append(fip.to_dict())
+        # instance_id is the device_id of the associated port. Neutron's
+        # fip-port-details extension returns device_id and device_owner with
+        # each floating IP; list ports only for floating IPs without it.
+        port_dict = {}
+        if any(fip.get('port_id') and not fip.get('port_details')
+               for fip in fips_list):
+            ports = port_list(self.request, **port_search_opts)
+            port_dict = collections.OrderedDict([(p['id'], p) for p in ports])
         for fip in fips_list:
-            self._set_instance_info(fip, port_dict.get(fip['port_id']))
+            port = port_dict.get(fip['port_id'])
+            if port is None and fip.get('port_details'):
+                details = fip['port_details']
+                port = types.SimpleNamespace(
+                    device_id=details.get('device_id'),
+                    device_owner=details.get('device_owner') or '')
+            self._set_instance_info(fip, port)
         return [FloatingIp(fip) for fip in fips_list]
 
     @profiler.trace
@@ -1060,6 +1072,75 @@ def list_resources_with_long_filters(list_method,
         return resources
 
 
+def _project_filter(params):
+    """Translate horizon's ``tenant_id`` filter for openstacksdk.
+
+    For ports, subnets, subnet pools, routers and trunks openstacksdk only
+    knows ``project_id`` as a server-side filter. An unknown ``tenant_id`` is
+    not sent to neutron; the SDK lists everything the token can see and
+    filters client-side, which for an admin token is the whole cloud.
+    """
+    if 'tenant_id' not in params:
+        return params
+    params = dict(params)
+    tenant_id = params.pop('tenant_id')
+    params.setdefault('project_id', tenant_id)
+    return params
+
+
+# Above this many networks one unfiltered subnet listing is cheaper than
+# several filtered ones.
+_SUBNET_LOOKUP_MAX_NETWORKS = 100
+_SUBNET_LOOKUP_CHUNK = 40
+_ID_LOOKUP_CHUNK = 40
+
+
+def _networks_by_ids(request, ids, params):
+    """Fetch networks by id with a server-side filter.
+
+    openstacksdk has no server-side ``id`` filter for networks: it lists
+    every network the token can see and filters client-side, once per id
+    (571 networks and ~4 s per call for an admin on a large cloud). Neutron
+    filters by id itself, so query it directly and build the SDK objects
+    the same way the SDK builds them from a list response.
+    """
+    query = {k: v for k, v in params.items()
+             if k not in ('id', 'retrieve_all', 'paginated')}
+    query = sdk_network.Network._query_mapping._transpose(
+        query, sdk_network.Network)
+    client = networkclient(request)
+    ids = sorted(ids)
+    networks = []
+    for i in range(0, len(ids), _ID_LOOKUP_CHUNK):
+        resp = client.get('/networks',
+                          params=dict(query, id=ids[i:i + _ID_LOOKUP_CHUNK]),
+                          raise_exc=False)
+        sdk_exceptions.raise_from_response(resp)
+        networks.extend(sdk_network.Network.existing(**raw)
+                        for raw in resp.json().get('networks', []))
+    return networks
+
+
+def _subnets_for_networks(request, networks):
+    """List the subnets of ``networks`` only.
+
+    The subnet ``id`` filter is client-side in openstacksdk, ``network_id``
+    is server-side, so filter by network.
+    """
+    net_ids = sorted({n.id for n in networks
+                      if getattr(n, 'subnet_ids', None)})
+    if not net_ids:
+        return []
+    if len(net_ids) > _SUBNET_LOOKUP_MAX_NETWORKS:
+        return subnet_list(request)
+    subnets = []
+    for i in range(0, len(net_ids), _SUBNET_LOOKUP_CHUNK):
+        subnets.extend(subnet_list(
+            request,
+            network_id=tuple(net_ids[i:i + _SUBNET_LOOKUP_CHUNK])))
+    return subnets
+
+
 @profiler.trace
 def trunk_show(request, trunk_id):
     LOG.debug("trunk_show(): trunk_id=%s", trunk_id)
@@ -1070,7 +1151,7 @@ def trunk_show(request, trunk_id):
 @profiler.trace
 def trunk_list(request, **params):
     LOG.debug("trunk_list(): params=%s", params)
-    trunks = networkclient(request).trunks(**params)
+    trunks = networkclient(request).trunks(**_project_filter(params))
     if not isinstance(trunks, (types.GeneratorType, list)):
         trunks = [trunks]
     return [Trunk(t.to_dict()) for t in trunks]
@@ -1200,6 +1281,11 @@ def _network_list_paged(request, page_data, params):
     return update_pagination(nets, page_data)
 
 
+@cached_api(
+    ttl=600,
+    scope=('token', 'project'),
+    versions=('network:project', 'network:global'),
+)
 @profiler.trace
 def network_list(request, single_page=False, **params):
     LOG.debug("network_list(): params=%s", params)
@@ -1209,24 +1295,26 @@ def network_list(request, single_page=False, **params):
     if 'id' in params and isinstance(params['id'], list):
         list_values = params['id']
     if single_page is True:
-        params['retrieve_all'] = False
+        # neutronclient took ``retrieve_all=False``; openstacksdk ignores it
+        # and follows every "next" link (all networks in pages of ``limit``)
+        # unless told not to paginate.
+        params['paginated'] = False
 
     networks = []
     if 'tenant_id' in params:
         params['project_id'] = params.pop('tenant_id')
-    for value in list_values:
-        params['id'] = value
-        for net in networkclient(request).networks(**params):
-            networks.append(net)
-    if not list_values:
+    if list_values:
+        networks = _networks_by_ids(request, list_values, params)
+    else:
         networks = networkclient(request).networks(**params)
-
-    # Get subnet list to expand subnet info in network list.
-    subnets = subnet_list(request)
-    subnet_dict = dict((s['id'], s) for s in subnets)
 
     if not isinstance(networks, (list, types.GeneratorType)):
         networks = [networks]
+    networks = list(networks)
+
+    # Get subnet list to expand subnet info in network list.
+    subnets = _subnets_for_networks(request, networks)
+    subnet_dict = dict((s['id'], s) for s in subnets)
     nets_with_subnet = []
     net_ids = set()
 
@@ -1582,6 +1670,14 @@ def _perform_query(
     return networks, has_more_data, has_prev_data
 
 
+_NETWORK_VERSIONS = ('network:project', 'network:global')
+
+
+@cached_api(
+    ttl=600,
+    scope=('token', 'project'),
+    versions=_NETWORK_VERSIONS,
+)
 @profiler.trace
 def network_list_for_tenant(request, tenant_id, include_external=False,
                             include_pre_auto_allocate=False, page_data=None,
@@ -1684,6 +1780,7 @@ def network_create(request, **kwargs):
     if 'tenant_id' not in kwargs:
         kwargs['tenant_id'] = request.user.project_id
     network = networkclient(request).create_network(**kwargs).to_dict()
+    bump_versions(request, _NETWORK_VERSIONS)
     return Network(network)
 
 
@@ -1693,6 +1790,7 @@ def network_update(request, network_id, **kwargs):
               {'network_id': network_id, 'params': kwargs})
     network = networkclient(request).update_network(network_id,
                                                     **kwargs).to_dict()
+    bump_versions(request, _NETWORK_VERSIONS)
     return Network(network)
 
 
@@ -1701,13 +1799,14 @@ def network_delete(request, network_id):
     LOG.debug("network_delete(): netid=%s", network_id)
     networkclient(request).delete_network(network_id)
     request.session['network_deleted'] = network_id
+    bump_versions(request, _NETWORK_VERSIONS)
 
 
 @profiler.trace
 @memoized
 def subnet_list(request, **params):
     LOG.debug("subnet_list(): params=%s", params)
-    subnets = networkclient(request).subnets(**params)
+    subnets = networkclient(request).subnets(**_project_filter(params))
     ret_val = [Subnet(s.to_dict()) for s in subnets]
     return ret_val
 
@@ -1768,7 +1867,8 @@ def subnet_delete(request, subnet_id):
 @profiler.trace
 def subnetpool_list(request, **params):
     LOG.debug("subnetpool_list(): params=%s", params)
-    subnetpools = networkclient(request).subnet_pools(**params)
+    subnetpools = networkclient(request).subnet_pools(
+        **_project_filter(params))
     if not isinstance(subnetpools, (types.GeneratorType, list)):
         subnetpools = [subnetpools]
     return [SubnetPool(s.to_dict()) for s in subnetpools]
@@ -1834,6 +1934,14 @@ def subnetpool_delete(request, subnetpool_id):
     return networkclient(request).delete_subnet_pool(subnetpool_id)
 
 
+_PORT_VERSIONS = ('port:project',)
+
+
+@cached_api(
+    ttl=300,
+    scope=('token', 'project'),
+    versions=_PORT_VERSIONS,
+)
 @profiler.trace
 @memoized
 def port_list(request, **params):
@@ -1869,11 +1977,10 @@ def port_list_with_trunk_types(request, **params):
     if 'tenant_id' in params:
         params['project_id'] = params.pop('tenant_id')
 
+    params = _project_filter(params)
     ports = networkclient(request).ports(**params)
     trunk_filters = {}
-    if 'tenant_id' in params:
-        trunk_filters['tenant_id'] = params['tenant_id']
-    elif 'project_id' in params:
+    if 'project_id' in params:
         trunk_filters['project_id'] = params['project_id']
     trunks = networkclient(request).trunks(**trunk_filters)
     parent_ports = set(t['port_id'] for t in trunks)
@@ -1928,6 +2035,7 @@ def port_create(request, network_id, **kwargs):
         kwargs['tenant_id'] = request.user.project_id
     kwargs['network_id'] = network_id
     port = networkclient(request).create_port(**kwargs).to_dict()
+    bump_versions(request, _PORT_VERSIONS)
     return Port(port)
 
 
@@ -1935,6 +2043,7 @@ def port_create(request, network_id, **kwargs):
 def port_delete(request, port_id):
     LOG.debug("port_delete(): portid=%s", port_id)
     networkclient(request).delete_port(port_id)
+    bump_versions(request, _PORT_VERSIONS)
 
 
 @profiler.trace
@@ -1943,6 +2052,7 @@ def port_update(request, port_id, **kwargs):
               {'port_id': port_id, 'kwargs': kwargs})
     kwargs = unescape_port_kwargs(**kwargs)
     port = networkclient(request).update_port(port_id, **kwargs).to_dict()
+    bump_versions(request, _PORT_VERSIONS)
     return Port(port)
 
 
@@ -1971,7 +2081,7 @@ def router_get(request, router_id, **params):
 
 @profiler.trace
 def router_list(request, **params):
-    routers = networkclient(request).routers(**params)
+    routers = networkclient(request).routers(**_project_filter(params))
     if not isinstance(routers, (types.GeneratorType, list)):
         routers = [routers]
     return [Router(r) for r in routers]
@@ -2097,6 +2207,20 @@ def list_dhcp_agent_hosting_networks(request, network, **params):
 
 
 @profiler.trace
+def dhcp_agent_network_counts(request):
+    """Number of DHCP agents hosting each network.
+
+    One call per DHCP agent instead of one call per network.
+    """
+    client = networkclient(request)
+    counts = collections.Counter()
+    for agent in client.agents(agent_type='DHCP agent'):
+        for network in client.dhcp_agent_hosting_networks(agent):
+            counts[network.id] += 1
+    return counts
+
+
+@profiler.trace
 def list_l3_agent_hosting_router(request, router, **params):
     agents = networkclient(request).routers_hosting_l3_agents(router,
                                                               **params)
@@ -2132,6 +2256,14 @@ def floating_ip_pools_list(request):
     return FloatingIpManager(request).list_pools()
 
 
+_FIP_VERSIONS = ('fip:project',)
+
+
+@cached_api(
+    ttl=600,
+    scope=('token', 'project'),
+    versions=_FIP_VERSIONS,
+)
 @memoized
 def tenant_floating_ip_list(request, all_tenants=False, **search_opts):
     return FloatingIpManager(request).list(all_tenants=all_tenants,
@@ -2163,19 +2295,27 @@ def tenant_floating_ip_get(request, floating_ip_id):
 
 
 def tenant_floating_ip_allocate(request, pool=None, tenant_id=None, **params):
-    return FloatingIpManager(request).allocate(pool, tenant_id, **params)
+    result = FloatingIpManager(request).allocate(pool, tenant_id, **params)
+    bump_versions(request, _FIP_VERSIONS)
+    return result
 
 
 def tenant_floating_ip_release(request, floating_ip_id):
-    return FloatingIpManager(request).release(floating_ip_id)
+    result = FloatingIpManager(request).release(floating_ip_id)
+    bump_versions(request, _FIP_VERSIONS)
+    return result
 
 
 def floating_ip_associate(request, floating_ip_id, port_id):
-    return FloatingIpManager(request).associate(floating_ip_id, port_id)
+    result = FloatingIpManager(request).associate(floating_ip_id, port_id)
+    bump_versions(request, _FIP_VERSIONS)
+    return result
 
 
 def floating_ip_disassociate(request, floating_ip_id):
-    return FloatingIpManager(request).disassociate(floating_ip_id)
+    result = FloatingIpManager(request).disassociate(floating_ip_id)
+    bump_versions(request, _FIP_VERSIONS)
+    return result
 
 
 def floating_ip_target_list(request):
@@ -2195,6 +2335,14 @@ def floating_ip_supported(request):
     return FloatingIpManager(request).is_supported()
 
 
+_SECGROUP_VERSIONS = ('secgroup:project',)
+
+
+@cached_api(
+    ttl=600,
+    scope=('token', 'project'),
+    versions=_SECGROUP_VERSIONS,
+)
 @memoized
 def security_group_list(request, **params):
     return SecurityGroupManager(request).list(**params)
@@ -2205,28 +2353,38 @@ def security_group_get(request, sg_id):
 
 
 def security_group_create(request, name, desc):
-    return SecurityGroupManager(request).create(name, desc)
+    result = SecurityGroupManager(request).create(name, desc)
+    bump_versions(request, _SECGROUP_VERSIONS)
+    return result
 
 
 def security_group_delete(request, sg_id):
-    return SecurityGroupManager(request).delete(sg_id)
+    result = SecurityGroupManager(request).delete(sg_id)
+    bump_versions(request, _SECGROUP_VERSIONS)
+    return result
 
 
 def security_group_update(request, sg_id, name, desc):
-    return SecurityGroupManager(request).update(sg_id, name, desc)
+    result = SecurityGroupManager(request).update(sg_id, name, desc)
+    bump_versions(request, _SECGROUP_VERSIONS)
+    return result
 
 
 def security_group_rule_create(request, parent_group_id,
                                direction, ethertype,
                                ip_protocol, from_port, to_port,
                                cidr, group_id, description=None):
-    return SecurityGroupManager(request).rule_create(
+    result = SecurityGroupManager(request).rule_create(
         parent_group_id, direction, ethertype, ip_protocol,
         from_port, to_port, cidr, group_id, description)
+    bump_versions(request, _SECGROUP_VERSIONS)
+    return result
 
 
 def security_group_rule_delete(request, sgr_id):
-    return SecurityGroupManager(request).rule_delete(sgr_id)
+    result = SecurityGroupManager(request).rule_delete(sgr_id)
+    bump_versions(request, _SECGROUP_VERSIONS)
+    return result
 
 
 def server_security_groups(request, instance_id):
@@ -2349,6 +2507,10 @@ def _server_get_addresses(request, server, ports, floating_ips, network_names):
     return dict(addresses)
 
 
+# Extensions per neutron endpoint; they only change on upgrades.
+_extensions = ProcessTTLCache(600)
+
+
 @profiler.trace
 @memoized
 def list_extensions(request):
@@ -2356,13 +2518,19 @@ def list_extensions(request):
 
     :param request: django request object
     """
+    neutron_url = base.url_for(request, 'network')
+    cached_extensions = _extensions.get(neutron_url)
+    if cached_extensions is not None:
+        return cached_extensions
     neutron_api = neutronclient(request)
     try:
         extensions_list = neutron_api.list_extensions()
     except exceptions.ServiceCatalogException:
         return {}
     if 'extensions' in extensions_list:
-        return tuple(extensions_list['extensions'])
+        result = tuple(extensions_list['extensions'])
+        _extensions.set(neutron_url, result)
+        return result
     return ()
 
 
